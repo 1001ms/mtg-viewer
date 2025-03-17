@@ -19,7 +19,7 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 #[AsCommand(
     name: 'import:card',
-    description: 'Add a short description for your command',
+    description: 'Import cards from CSV',
 )]
 class ImportCardCommand extends Command
 {
@@ -27,7 +27,7 @@ class ImportCardCommand extends Command
         private readonly EntityManagerInterface $entityManager,
         private readonly LoggerInterface        $logger,
         private array                           $csvHeader = []
-    )
+    ) 
     {
         parent::__construct();
     }
@@ -35,52 +35,70 @@ class ImportCardCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         ini_set('memory_limit', '2G');
-        // On récupère le temps actuel
         $io = new SymfonyStyle($input, $output);
         $filepath = __DIR__ . '/../../data/cards.csv';
-        $handle = fopen($filepath, 'r');
-
-        // On récupère le temps actuel
-        $start = microtime(true);
-
-        $this->logger->info('Importing cards from ' . $filepath);
-        if ($handle === false) {
+        
+        if (!file_exists($filepath)) {
+            $this->logger->error('File not found: ' . $filepath);
             $io->error('File not found');
             return Command::FAILURE;
         }
-
-        $i = 0;
+    
+        $handle = fopen($filepath, 'r');
+        if ($handle === false) {
+            $this->logger->error('Cannot open file: ' . $filepath);
+            $io->error('Cannot open file');
+            return Command::FAILURE;
+        }
+        
+        $start = microtime(true);
+        $this->logger->info('Starting card import from ' . $filepath);
+    
         $this->csvHeader = fgetcsv($handle);
-        $uuidInDatabase = $this->entityManager->getRepository(Card::class)->getAllUuids();
-
+        $uuidInDatabase = array_flip($this->entityManager->getRepository(Card::class)->getAllUuids());
+    
         $progressIndicator = new ProgressIndicator($output);
         $progressIndicator->start('Importing cards...');
-
+    
+        $batchSize = 10000;
+        $i = 0;
+        
+        $this->entityManager->beginTransaction();
+    
         while (($row = $this->readCSV($handle)) !== false) {
-            $i++;
-
-            if (!in_array($row['uuid'], $uuidInDatabase)) {
+            if (!isset($uuidInDatabase[$row['uuid']])) {
                 $this->addCard($row);
+                $this->logger->info('Card added: ' . $row['uuid']);
             }
-
-            if ($i % 2000 === 0) {
+    
+            if (++$i % $batchSize === 0) {
                 $this->entityManager->flush();
                 $this->entityManager->clear();
                 $progressIndicator->advance();
+                $this->logger->info('Flushed and cleared after processing ' . $i . ' cards');
+            }
+    
+            if ($i >= $batchSize) {
+                $this->logger->info("Reached limit of $batchSize cards, stopping import.");
+                break;
             }
         }
-        // Toujours flush en sorti de boucle
+    
         $this->entityManager->flush();
+        $this->entityManager->clear();
+        $this->entityManager->commit();
+        $this->logger->info('Final flush after importing ' . $i . ' cards');
         $progressIndicator->finish('Importing cards done.');
-
+    
         fclose($handle);
-
-        // On récupère le temps actuel, et on calcule la différence avec le temps de départ
+    
         $end = microtime(true);
         $timeElapsed = $end - $start;
+        $this->logger->info(sprintf('Import completed: %d cards in %.2f seconds', $i, $timeElapsed));
         $io->success(sprintf('Imported %d cards in %.2f seconds', $i, $timeElapsed));
+        
         return Command::SUCCESS;
-    }
+    }    
 
     private function readCSV(mixed $handle): array|false
     {
@@ -91,21 +109,25 @@ class ImportCardCommand extends Command
         return array_combine($this->csvHeader, $row);
     }
 
-    private function addCard(array $row)
+    private function addCard(array $row): void
     {
-        $uuid = $row['uuid'];
+        try {
+            $uuid = $row['uuid'];
 
-        $card = new Card();
-        $card->setUuid($uuid);
-        $card->setManaValue($row['manaValue']);
-        $card->setManaCost($row['manaCost']);
-        $card->setName($row['name']);
-        $card->setRarity($row['rarity']);
-        $card->setSetCode($row['setCode']);
-        $card->setSubtype($row['subtypes']);
-        $card->setText($row['text']);
-        $card->setType($row['type']);
-        $this->entityManager->persist($card);
-
+            $card = new Card();
+            $card->setUuid($uuid);
+            $card->setManaValue($row['manaValue']);
+            $card->setManaCost($row['manaCost']);
+            $card->setName($row['name']);
+            $card->setRarity($row['rarity']);
+            $card->setSetCode($row['setCode']);
+            $card->setSubtype($row['subtypes']);
+            $card->setText($row['text']);
+            $card->setType($row['type']);
+            
+            $this->entityManager->persist($card);
+        } catch (\Exception $e) {
+            $this->logger->error('Error while adding card: ' . $e->getMessage());
+        }
     }
 }
